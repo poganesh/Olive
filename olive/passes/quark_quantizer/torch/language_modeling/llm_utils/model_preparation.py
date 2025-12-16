@@ -12,12 +12,28 @@ import numpy as np
 import psutil
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    Llama4ForCausalLM,
+    Llama4ForConditionalGeneration,
+    MllamaForConditionalGeneration,
+)
+from transformers.models.dbrx.modeling_dbrx import DbrxExperts, DbrxForCausalLM
+from transformers.models.llama4.modeling_llama4 import Llama4TextMoe
+
+from quark.shares.utils.import_utils import is_transformers_version_higher_or_equal
+
+if is_transformers_version_higher_or_equal("4.55.1"):
+    from transformers import Mxfp4Config
+    from transformers.models.gpt_oss.modeling_gpt_oss import GptOssExperts
 
 logger = logging.getLogger(__name__)
 
 MODEL_NAME_KV_LAYERS_MAP = {
-    "mllama": ["*self_attn.k_proj", "*self_attn.v_proj"],
+    "mllama": ["*language_model.*k_proj", "*language_model.*v_proj"],
+    "llama4": ["*language_model.*.k_proj", "*language_model.*.v_proj"],
     "llama": ["*k_proj", "*v_proj"],
     "opt": ["*k_proj", "*v_proj"],
     "qwen2moe": ["*k_proj", "*v_proj"],
@@ -35,10 +51,14 @@ MODEL_NAME_KV_LAYERS_MAP = {
     "deepseekv2v3": ["*kv_b_proj"],
     "deepseek": ["*k_proj", "*v_proj"],
     "gemma2": ["*k_proj", "*v_proj"],
+    "gemma3_llm": ["*k_proj", "*v_proj"],
+    "gemma3_mllm": ["*language_model.*k_proj", "*language_model.*v_proj"],
+    "gptoss": ["*k_proj", "*v_proj"],
 }
 
 MODEL_NAME_Q_LAYERS_MAP = {
     "mllama": "*self_attn.q_proj",
+    "llama4": "*language_model.*.q_proj",
     "llama": "*q_proj",
     "opt": "*q_proj",
     "qwen2moe": "*q_proj",
@@ -54,10 +74,18 @@ MODEL_NAME_Q_LAYERS_MAP = {
     "dbrx": ["*Wqkv"],
     "deepseek": "*q_proj",
     "deepseekv2v3": ["*q_a_proj", "*q_b_proj"],
+    "gemma3_llm": "*q_proj",
+    "gemma3_mllm": "*language_model.*q_proj",
 }
 
 MODEL_NAME_EXCLUDE_LAYERS_MAP = {
     "mllama": ["*lm_head", "*patch_embedding", "multi_modal_projector"],
+    "llama4": [
+        "multi_modal_projector*",
+        "*feed_forward.router*",
+        "vision_model*",
+        "*lm_head",
+    ],
     "llama": ["lm_head"],
     "opt": ["lm_head"],
     "qwen2moe": ["lm_head", "*.gate", "*.shared_expert_gate"],
@@ -74,10 +102,13 @@ MODEL_NAME_EXCLUDE_LAYERS_MAP = {
     "cohere": ["lm_head"],
     "dbrx": ["lm_head", "*router.layer"],
     "deepseek": ["lm_head", "*.gate"],
-    "deepseekv2v3": ["lm_head", "*.gate"],
+    "deepseekv2v3": ["lm_head", "*self_attn*", "*mlp.gate"],
     "olmo": ["lm_head"],
     "gemma2": ["lm_head"],
+    "gemma3_llm": ["*lm_head"],
+    "gemma3_mllm": ["*vision_tower*", "*multi_modal_projector*", "*lm_head"],
     "instella": ["lm_head"],
+    "gptoss": ["*lm_head"],
 }
 
 MOE_MODEL_NAME_EXPERTS_LAYERS_MAP = {
@@ -88,6 +119,7 @@ MOE_MODEL_NAME_EXPERTS_LAYERS_MAP = {
 
 MODEL_NAME_PATTERN_MAP = {
     "Mllama": "mllama",
+    "Llama4": "llama4",
     "Llama": "llama",
     "OPT": "opt",
     "Qwen2Moe": "qwen2moe",
@@ -106,18 +138,19 @@ MODEL_NAME_PATTERN_MAP = {
     "Deepseek": "deepseek",
     "olmo": "olmo",
     "gemma2": "gemma2",
+    "Gemma3ForCausalLM": "gemma3_llm",
+    "Gemma3ForConditionalGeneration": "gemma3_mllm",
     "instella": "instella",
+    "gptoss": "gptoss",
 }
 
 
-def get_tokenizer(ckpt_path: str, max_seq_len: int = 2048, model_type: Optional[str] = None) -> AutoTokenizer:
+def get_tokenizer(
+    ckpt_path: str, max_seq_len: int = 2048, model_type: Optional[str] = None, trust_remote_code: bool = True
+) -> AutoTokenizer:
     logger.info("Initializing tokenizer from %s", ckpt_path)
-    use_fast = model_type in ["grok", "cohere", "olmo", "instella", "deepseekv2v3"]
-    tokenizer = AutoTokenizer.from_pretrained(
-        ckpt_path, model_max_length=max_seq_len, padding_side="left", trust_remote_code=True, use_fast=use_fast
-    )
+    tokenizer = AutoTokenizer.from_pretrained(ckpt_path, padding_side="left", trust_remote_code=trust_remote_code)
     if model_type and model_type in ["qwen", "qwen2"]:
-        # qwen2 use token id 151643 as pad and eos tokens
         tokenizer.pad_token = tokenizer.convert_ids_to_tokens(151643)
         tokenizer.eos_token = tokenizer.convert_ids_to_tokens(151643)
 
@@ -130,18 +163,27 @@ def get_tokenizer(ckpt_path: str, max_seq_len: int = 2048, model_type: Optional[
     return tokenizer
 
 
-def prepare_for_moe_quant(model: nn.Module):
-    from quark.torch.quantization.utils import set_op_by_name
-    from transformers.models.dbrx.modeling_dbrx import DbrxExperts, DbrxForCausalLM
-
+def prepare_for_moe_quant(model: nn.Module, quant_algo: Optional[list[str]] = None):
     from olive.passes.quark_quantizer.torch.language_modeling.module_replacement.dbrx_expert import DbrxExpertsQuark
+    from olive.passes.quark_quantizer.torch.language_modeling.module_replacement.replacement_utils import (
+        replace_gptoss_experts_with_linear,
+        replace_llama4_experts_with_sequential,
+    )
+    from quark.torch.utils import setattr_recursive
 
-    if isinstance(model, DbrxForCausalLM):
+    if isinstance(model, (DbrxForCausalLM, Llama4ForConditionalGeneration, Llama4ForCausalLM)):
         for name, module in model.named_modules(remove_duplicate=False):
             if isinstance(module, DbrxExperts):
                 new_experts = DbrxExpertsQuark.from_float(module)
-                set_op_by_name(model, name, new_experts)
+                setattr_recursive(model, name, new_experts)
                 logger.info("module %s has been replaced", name)
+            elif isinstance(module, Llama4TextMoe):
+                replace_llama4_experts_with_sequential(module, model.config.text_config)
+    elif hasattr(model, "config") and hasattr(model.config, "model_type") and model.config.model_type == "gpt_oss":
+        use_awq = True if quant_algo is not None and "awq" in quant_algo else False
+        for name, module in model.named_modules(remove_duplicate=False):
+            if isinstance(module, GptOssExperts):
+                replace_gptoss_experts_with_linear(module, use_awq)
 
 
 def get_model(
@@ -151,6 +193,7 @@ def get_model(
     multi_gpu: bool = False,
     multi_device=False,
     attn_implementation: str = "eager",
+    trust_remote_code: bool = True,
 ) -> tuple[nn.Module, torch.dtype]:
     if data_type == "float16":
         model_dtype = torch.float16
@@ -162,29 +205,43 @@ def get_model(
         model_dtype = data_type
     else:
         raise ValueError(f"{data_type} not support for current model")
-    mllama_list = [
-        "Llama-3.2-11B-Vision",
-        "Llama-3.2-90B-Vision",
-        "Llama-3.2-11B-Vision-Instruct",
-        "Llama-3.2-90B-Vision-Instruct",
-    ]
-    model_name = os.path.basename(os.path.normpath(ckpt_path))
+
+    config = AutoConfig.from_pretrained(ckpt_path, trust_remote_code=trust_remote_code)
     max_memory = None
     if multi_device:
         device = "auto"
         max_memory = get_device_max_memory()
     if multi_gpu:
         device = "auto"
-    if model_name in mllama_list:
-        from transformers import MllamaForConditionalGeneration
 
+    if config.model_type == "mllama":
         model = MllamaForConditionalGeneration.from_pretrained(
             ckpt_path,
             device_map=device,
             torch_dtype=model_dtype,
             max_memory=max_memory,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
             attn_implementation=attn_implementation,
+        )
+    elif config.model_type == "llama4":
+        model = Llama4ForConditionalGeneration.from_pretrained(
+            ckpt_path,
+            device_map=device,
+            torch_dtype=model_dtype,
+            max_memory=max_memory,
+            trust_remote_code=trust_remote_code,
+            attn_implementation=attn_implementation,
+        )
+    elif config.model_type == "gpt_oss":
+        quantization_config = Mxfp4Config(dequantize=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            ckpt_path,
+            device_map=device,
+            torch_dtype=model_dtype,
+            max_memory=max_memory,
+            trust_remote_code=trust_remote_code,
+            attn_implementation=attn_implementation,
+            quantization_config=quantization_config,
         )
     else:
         try:
@@ -193,18 +250,22 @@ def get_model(
                 device_map=device,
                 torch_dtype=model_dtype,
                 max_memory=max_memory,
-                trust_remote_code=True,
+                trust_remote_code=trust_remote_code,
                 attn_implementation=attn_implementation,
             )
         except Exception:
             model = AutoModelForCausalLM.from_pretrained(
-                ckpt_path, device_map=device, torch_dtype=model_dtype, max_memory=max_memory, trust_remote_code=True
+                ckpt_path,
+                device_map=device,
+                torch_dtype=model_dtype,
+                max_memory=max_memory,
+                trust_remote_code=trust_remote_code,
             )
+
     if multi_device and hasattr(model, "hf_device_map"):
         logger.info("device_map: %s", model.hf_device_map)
-    # For certain models, the attribute model.config._name_or_path is an empty string; enforce the setting here.
-    model.config._name_or_path = ckpt_path  # pylint: disable=protected-access
 
+    model.config._name_or_path = ckpt_path  # pylint: disable=protected-access
     model.eval()
     model_dtype = next(model.parameters()).dtype
 
@@ -219,7 +280,7 @@ def get_model_type(model: nn.Module) -> str:
     logger.info("There may be risks associated with model loading, algorithm configuration, and exporting.")
     logger.info("However, this does not mean that Quark definitively does not support this model.")
     logger.info(
-        "If you choose to run this model, please add the model information to the `get_model_type` function in utils/model_preparation.py."
+        "If you choose to run this model, please add the model information to the `get_model_type` function in model_preparation.py."
     )
     return "unknown"
 
@@ -251,23 +312,21 @@ def set_seed(seed: int) -> None:
 def get_device_max_memory() -> dict[Union[int, str], Union[int, str]]:
     for i in range(torch.cuda.device_count()):
         _ = torch.tensor([0], device=i)
-        cuda_avail_memory = {i: torch.cuda.mem_get_info(i)[0] for i in range(torch.cuda.device_count())}
-        cpu_avail_memory = psutil.virtual_memory().available
-        max_memory = {}
-        for cuda_num, cuda_memory in cuda_avail_memory.items():
-            cuda_memory_gb = cuda_memory / (10**9)
-            logger.info("GPU%s cuda_avail_memory: %.1fGB", cuda_num, cuda_memory_gb)
-            if cuda_num == 0:
-                # The ratio is an experience value that you can manually adjust yourself.
-                gpu0_ratio = 0.5 if cuda_memory_gb > 30 else 0.3
-                max_memory[cuda_num] = f"{cuda_memory_gb * gpu0_ratio:.1f}GB"
-            else:
-                other_ratio = 0.875 if cuda_memory_gb > 30 else 0.7
-                max_memory[cuda_num] = f"{cuda_memory_gb * other_ratio:.1f}GB"
-        logger.info("cpu_avail_memory: %.1fGB", cpu_avail_memory / (10**9))
-        cpu_ratio = 0.875
-        max_memory["cpu"] = f"{cpu_avail_memory / (10**9) * cpu_ratio:.1f}GB"
-        logger.info("final_use_model_kwargs: %s", max_memory)
-        # max_memory =  {0: '0.1GB', 'cpu': '100GB'}
+    cuda_avail_memory = {i: torch.cuda.mem_get_info(i)[0] for i in range(torch.cuda.device_count())}
+    cpu_avail_memory = psutil.virtual_memory().available
+    max_memory = {}
+    for cuda_num, cuda_memory in cuda_avail_memory.items():
+        cuda_memory_gb = cuda_memory / (10**9)
+        logger.info("GPU%s cuda_avail_memory: %.1fGB", cuda_num, cuda_memory_gb)
+        if cuda_num == 0:
+            gpu0_ratio = 0.5 if cuda_memory_gb > 30 else 0.3
+            max_memory[cuda_num] = f"{cuda_memory_gb * gpu0_ratio:.1f}GB"
+        else:
+            other_ratio = 0.875 if cuda_memory_gb > 30 else 0.7
+            max_memory[cuda_num] = f"{cuda_memory_gb * other_ratio:.1f}GB"
+    logger.info("cpu_avail_memory: %.1fGB", cpu_avail_memory / (10**9))
+    cpu_ratio = 0.875
+    max_memory["cpu"] = f"{cpu_avail_memory / (10**9) * cpu_ratio:.1f}GB"
+    logger.info("final_use_model_kwargs: %s", max_memory)
 
     return max_memory

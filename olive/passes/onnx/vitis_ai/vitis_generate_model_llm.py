@@ -57,6 +57,11 @@ class VitisGenerateModelLLM(Pass):
                 default_value="v2",
                 description="NPU LLM op version: 'v2'",
             ),
+            "no_prune_logits": PassConfigParam(
+                type_=bool,
+                default_value=True,
+                description="Disable pruning of logits (lmhead) in the model generation.",
+            ),
         }
 
     def _run_for_config(
@@ -84,6 +89,7 @@ class VitisGenerateModelLLM(Pass):
             npu_op_version=config.npu_op_version,
             basic=config.basic,
             use_ep=config.use_ep,
+            no_prune_logits=config.no_prune_logits,
         )
         
         # decode optimization produces fusion.onnx
@@ -95,5 +101,3 @@ class VitisGenerateModelLLM(Pass):
             model_path=output_dir,
             onnx_file_name=onnx_file_name,
         )
-
-
