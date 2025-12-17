@@ -92,8 +92,8 @@ class VitisGenerateModelLLM(Pass):
             no_prune_logits=config.no_prune_logits,
         )
         
-        # decode optimization produces fusion.onnx
-        onnx_file_name = "fusion.onnx"
+        # decode optimization produces model.onnx
+        onnx_file_name = "model.onnx"
         
         logger.info("[VitisGenerateModelLLM] Using output model file: %s", onnx_file_name)
         
