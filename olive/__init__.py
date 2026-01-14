@@ -20,8 +20,10 @@ __version__ = "0.11.0.dev0"
 
 # Import Python API functions
 from olive.cli.api import (  # noqa: E402
+    benchmark,
     capture_onnx_graph,
     convert_adapters,
+    diffusion_lora,
     extract_adapters,
     finetune,
     generate_adapter,
@@ -36,8 +38,10 @@ __all__ = [
     "ModelOutput",
     "WorkflowOutput",
     # Python API functions
+    "benchmark",
     "capture_onnx_graph",
     "convert_adapters",
+    "diffusion_lora",
     "extract_adapters",
     "finetune",
     "generate_adapter",
