@@ -16,15 +16,15 @@ logger = logging.getLogger(__name__)
 
 class VitisGenerateModelLLM(Pass):
     """Olive pass for generating NPU models using AMD Vitis toolchain.
-    
+
     Supports multiple flows:
     - full_fusion: NPU full fusion model (default)
     - gpt_oss: GPT-OSS specific flow (via model_type)
-    
+
     Input can be:
     - HfModelHandler: For models coming from quantization pass
     - ONNXModelHandler: For pre-quantized models like GPT-OSS
-    
+
     All flows output model.onnx for consistency.
     """
 
@@ -84,10 +84,7 @@ class VitisGenerateModelLLM(Pass):
         }
 
     def _run_for_config(
-        self, 
-        model: Union[HfModelHandler, ONNXModelHandler], 
-        config: BasePassConfig, 
-        output_model_path: str
+        self, model: Union[HfModelHandler, ONNXModelHandler], config: BasePassConfig, output_model_path: str
     ) -> ONNXModelHandler:
         from model_generate import generate_npu_model
 
