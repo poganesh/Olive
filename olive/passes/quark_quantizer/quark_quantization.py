@@ -165,8 +165,8 @@ class QuarkQuantization(Pass):
             str(model.model_path),
             config.data_type,
             device,
-            multi_gpu=False,
-            multi_device=False,
+            multi_gpu=True,
+            multi_device=True,
             attn_implementation="eager",
             trust_remote_code=config.trust_remote_code,
         )
@@ -238,7 +238,7 @@ class QuarkQuantization(Pass):
 
         # 4. Quantize model
         logger.info("[INFO] Starting model quantization")
-        quantizer = ModelQuantizer(quant_config, multi_device=False)
+        quantizer = ModelQuantizer(quant_config, multi_device=True)
         torch_model = quantizer.quantize_model(torch_model, calib_dataloader)
 
         # 5. Freeze model

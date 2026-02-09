@@ -34,7 +34,7 @@ class VitisGenerateModelLLM(Pass):
             "optimize": PassConfigParam(
                 type_=str,
                 default_value="full_fusion",
-                description="Optimization mode: 'full_fusion'.",
+                description="Optimization mode: 'full_fusion', 'decode'.",
             ),
             "model_type": PassConfigParam(
                 type_=str,
